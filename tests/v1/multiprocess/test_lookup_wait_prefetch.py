@@ -12,6 +12,9 @@ manager is mocked, so no GPU or native bitmap is needed.
 from unittest import mock
 import threading
 
+# Third Party
+import pytest
+
 # First Party
 from lmcache.lmcache_native import Bitmap
 from lmcache.v1.distributed.api import PrefetchHandle
@@ -36,6 +39,13 @@ def _make_module(ctx):
     module._ctx = ctx
     module._prefetch_jobs = {}
     module._prefetch_job_lock = threading.Lock()
+    module._abandoned_jobs = []
+    module._abandoned_jobs_cv = threading.Condition()
+    module._cleanup_stop = False
+    module._cleanup_thread = threading.Thread(
+        target=module._run_abandoned_prefetch_cleanup, daemon=True
+    )
+    module._cleanup_thread.start()
     return module
 
 
@@ -93,3 +103,135 @@ def test_wait_prefetch_status_timeout_returns_none_and_keeps_job():
 def test_wait_prefetch_status_unknown_request_returns_zero():
     module = _make_module(_make_ctx())
     assert module.wait_prefetch_status("missing", timeout=1.0) == 0
+
+
+def _cleanup_job(request_id: str = "req") -> _PrefetchJob:
+    handle = PrefetchHandle(
+        prefetch_request_id=7,
+        external_request_id=request_id,
+        l1_found_indices=(),
+        l1_hit_chunks=0,
+        total_requested_keys=3,
+        submit_time=0.0,
+    )
+    return _PrefetchJob(
+        handle=handle,
+        world_size=1,
+        request_id=request_id,
+        requested_tokens=768,
+        keys=("key-0", "key-1", "key-2"),
+        num_kv_readers=2,
+    )
+
+
+def test_status_query_exception_releases_job_claim():
+    ctx = _make_ctx()
+    ctx.storage_manager.query_prefetch_status.side_effect = RuntimeError("boom")
+    module = _make_module(ctx)
+    job = _cleanup_job()
+    module._prefetch_jobs["req"] = job
+
+    with pytest.raises(RuntimeError, match="boom"):
+        module.query_prefetch_status("req")
+
+    assert job.status_claimed is False
+    assert module._take_prefetch_job("req") is job
+    module.close()
+
+
+def test_end_session_cleans_prefetch_that_finishes_later():
+    completed = threading.Event()
+    allow_completion = threading.Event()
+    found = Bitmap(3)
+    found.set(0)
+    found.set(2)
+    ctx = _make_ctx(found=found)
+
+    def query_after_completion(handle):
+        if not allow_completion.is_set():
+            return None
+        completed.set()
+        return found
+
+    ctx.storage_manager.query_prefetch_status.side_effect = query_after_completion
+    ctx.session_manager.remove.return_value = None
+    module = _make_module(ctx)
+    job = _cleanup_job()
+    module._prefetch_jobs["req"] = job
+
+    module.end_session("req")
+    assert "req" not in module._prefetch_jobs
+    ctx.storage_manager.finish_read_prefetched.assert_not_called()
+
+    allow_completion.set()
+    assert completed.wait(1.0)
+    module.close()
+    ctx.storage_manager.finish_read_prefetched.assert_called_once_with(
+        ["key-0", "key-2"], read_locks=2
+    )
+
+
+def test_end_session_cleans_already_completed_prefetch():
+    found = Bitmap(3)
+    found.set(1)
+    ctx = _make_ctx(wait_result=True, found=found)
+    ctx.session_manager.remove.return_value = None
+    module = _make_module(ctx)
+    module._prefetch_jobs["req"] = _cleanup_job()
+
+    module.end_session("req")
+    module.close()
+
+    ctx.storage_manager.finish_read_prefetched.assert_called_once_with(
+        ["key-1"], read_locks=2
+    )
+    assert "req" not in module._prefetch_jobs
+
+
+def test_status_query_and_end_session_have_single_job_owner():
+    found = Bitmap(3, 3)
+    query_started = threading.Event()
+    allow_query = threading.Event()
+    ctx = _make_ctx(found=found)
+    ctx.session_manager.remove.return_value = None
+
+    def blocking_query(handle):
+        query_started.set()
+        assert allow_query.wait(1.0)
+        return found
+
+    ctx.storage_manager.query_prefetch_status.side_effect = blocking_query
+    module = _make_module(ctx)
+    module._prefetch_jobs["req"] = _cleanup_job()
+    result: list[int | None] = []
+    query_thread = threading.Thread(
+        target=lambda: result.append(module.query_prefetch_status("req"))
+    )
+    query_thread.start()
+    assert query_started.wait(1.0)
+
+    end_thread = threading.Thread(target=lambda: module.end_session("req"))
+    end_thread.start()
+    assert end_thread.is_alive()
+
+    allow_query.set()
+    query_thread.join(timeout=1.0)
+    end_thread.join(timeout=1.0)
+    module.close()
+
+    assert result == [3]
+    ctx.storage_manager.finish_read_prefetched.assert_not_called()
+
+
+def test_status_consumption_prevents_end_session_double_release():
+    found = Bitmap(3, 3)
+    ctx = _make_ctx(wait_result=True, found=found)
+    ctx.session_manager.remove.return_value = None
+    module = _make_module(ctx)
+    module._prefetch_jobs["req"] = _cleanup_job()
+
+    assert module.wait_prefetch_status("req", timeout=1.0) == 3
+    module.end_session("req")
+    module.close()
+
+    ctx.storage_manager.finish_read_prefetched.assert_not_called()

@@ -75,6 +75,12 @@ class ExtraConfigDefault(enum.Enum):
     # lmcache/v1/platform/isolated_ipc.py. Must match the LMCache server's
     # ``--isolated-ipc`` setting.
     isolated_ipc = False
+    # Maximum seconds to wait for an L2 prefetch/load result, independent
+    # of ``mq_timeout`` (which bounds a single MQ request). ``0.0`` disables
+    # the deadline and preserves the historical behavior of waiting until
+    # the prefetch completes. When exceeded, the lookup is reported as a
+    # miss so the engine recomputes.
+    l2_load_timeout = 0.0
 
 
 # Backward-compatible aliases for the legacy `lmcache_mp_connector_0180`
@@ -627,11 +633,14 @@ class LMCacheMPSchedulerAdapter:
             url: RequestClientFactory.create(url, context=context)
             for url in self._server_urls
         }
+        l2_load_timeout = ExtraConfigDefault.l2_load_timeout.value
         if extra_config is not None:
             cfg = _resolve_extra_config(extra_config)
             mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
             heartbeat_interval = cfg[ExtraConfigDefault.heartbeat_interval.name]
+            l2_load_timeout = cfg[ExtraConfigDefault.l2_load_timeout.name]
         self._mq_timeout = mq_timeout
+        self._l2_load_timeout = l2_load_timeout
 
         # Lookup state tracking:
         # - _pending_lookups: request_ids submitted but not yet resolved
@@ -650,6 +659,9 @@ class LMCacheMPSchedulerAdapter:
         self._lookup_params: dict[
             str, tuple[list[int], str, dict[str, Any] | None]
         ] = {}
+        # Monotonic submit time per request, for the optional L2 load
+        # deadline (``l2_load_timeout``). Cleared in cleanup_lookup_result.
+        self._lookup_submitted_at: dict[str, float] = {}
 
         self.model_name = model_name
         self.parallel_strategy = parallel_strategy
@@ -779,6 +791,7 @@ class LMCacheMPSchedulerAdapter:
             # Skip if there is already a lookup request
             return
 
+        print(f'[qyy debug][maybe_submit_lookup_request] request_id:{request_id}, token_ids:{token_ids}, lmcache_tokens_per_chunk={self.lmcache_tokens_per_chunk}')
         aligned_end = (
             len(token_ids) // self.lmcache_tokens_per_chunk
         ) * self.lmcache_tokens_per_chunk
@@ -805,6 +818,9 @@ class LMCacheMPSchedulerAdapter:
         )
         self._pending_lookups.add(request_id)
         self._lookup_params[request_id] = (token_ids, cache_salt, request_configs)
+        if not hasattr(self, "_lookup_submitted_at"):
+            self._lookup_submitted_at = {}
+        self._lookup_submitted_at[request_id] = time.monotonic()
 
     def _free_inconsistent_lookup_locks(
         self,
@@ -881,6 +897,26 @@ class LMCacheMPSchedulerAdapter:
         if request_id in self._finished_lookup_results:
             # Aggregation already done; return the cached value.
             return self._finished_lookup_results[request_id]
+
+        if self._l2_load_timeout > 0.0:
+            submitted_at = self._lookup_submitted_at.get(request_id)
+            if (
+                submitted_at is not None
+                and time.monotonic() - submitted_at >= self._l2_load_timeout
+            ):
+                # L2 load exceeded the configured budget. Report a miss so
+                # vLLM recomputes, matching the coarse fallback of the other
+                # timeout paths here (which also return 0). END_SESSION
+                # transfers any unresolved daemon-side prefetch to its
+                # abandoned-job cleanup path.
+                logger.warning(
+                    "[req=%s] L2 load exceeded l2_load_timeout=%.1fs; "
+                    "reporting cache miss for recompute.",
+                    request_id,
+                    self._l2_load_timeout,
+                )
+                self._finished_lookup_results[request_id] = 0
+                return 0
 
         ack = self._unacked_lookups.get(request_id)
         if ack is not None:
@@ -964,6 +1000,7 @@ class LMCacheMPSchedulerAdapter:
         self._finished_lookup_results.pop(request_id, None)
         self._per_server_hits.pop(request_id, None)
         self._lookup_params.pop(request_id, None)
+        self._lookup_submitted_at.pop(request_id, None)
 
     def shutdown(self) -> None:
         """Shutdown the scheduler adapter and its resources."""
@@ -1029,10 +1066,11 @@ class LMCacheMPSchedulerAdapter:
         Args:
             request_id: The ID of the finished request.
         """
-        if not self.is_healthy:
+        had_lookup = request_id in self._pending_lookups
+        ack = self._unacked_lookups.pop(request_id, None)
+        if not self.is_healthy and not had_lookup and ack is None:
             return
 
-        ack = self._unacked_lookups.pop(request_id, None)
         if ack is not None:
             remaining = max(
                 0.0, self._mq_timeout - (time.monotonic() - ack.submitted_at)
@@ -1042,7 +1080,6 @@ class LMCacheMPSchedulerAdapter:
                     fut.result(timeout=remaining)
                 except TimeoutError:
                     self._mark_lookup_timed_out(url)
-                    return
 
         for url in self._server_urls:
             self.req_clients[url].end_session(request_id)

@@ -103,6 +103,9 @@ class _PrefetchJob:
     # Names the ``lookup()`` branch that returned before submitting a prefetch
     # task; empty on the normal path.
     early_exit_reason: str = ""
+    keys: tuple[ObjectKey, ...] = ()
+    num_kv_readers: int = 1
+    status_claimed: bool = False
 
 
 class LookupModule:
@@ -123,6 +126,15 @@ class LookupModule:
         self._ctx = ctx
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
+        self._abandoned_jobs: list[_PrefetchJob] = []
+        self._abandoned_jobs_cv = threading.Condition()
+        self._cleanup_stop = False
+        self._cleanup_thread = threading.Thread(
+            target=self._run_abandoned_prefetch_cleanup,
+            name="lmcache-prefetch-cleanup",
+            daemon=True,
+        )
+        self._cleanup_thread.start()
         self._setup_metrics()
 
     @property
@@ -176,8 +188,11 @@ class LookupModule:
         }
 
     def close(self) -> None:
-        """Release resources owned by this module (no-op)."""
-        pass
+        """Stop the abandoned-prefetch cleanup worker."""
+        with self._abandoned_jobs_cv:
+            self._cleanup_stop = True
+            self._abandoned_jobs_cv.notify_all()
+        self._cleanup_thread.join(timeout=1.0)
 
     # -----------------------------------------------------------------
     # Handlers
@@ -349,6 +364,8 @@ class LookupModule:
                 attn_desc=attn_desc,
                 model_name=model_name,
                 cache_salt=key.cache_salt,
+                keys=tuple(obj_keys),
+                num_kv_readers=num_kv_readers,
             )
         )
 
@@ -400,16 +417,36 @@ class LookupModule:
         """
         with self._prefetch_job_lock:
             job = self._prefetch_jobs.get(request_id)
-        if job is None:
-            logger.warning(
-                "Prefetch job for request %s not found (already completed or invalid)",
-                request_id,
-            )
-            return 0
+            if job is None:
+                logger.warning(
+                    "Prefetch job for request %s not found "
+                    "(already completed or invalid)",
+                    request_id,
+                )
+                return 0
+            if job.status_claimed:
+                return None
+            job.status_claimed = True
 
-        found = self._ctx.storage_manager.query_prefetch_status(job.handle)
+        try:
+            found = self._ctx.storage_manager.query_prefetch_status(job.handle)
+        except Exception:
+            with self._prefetch_job_lock:
+                current = self._prefetch_jobs.get(request_id)
+                if current is job:
+                    job.status_claimed = False
+            raise
         if found is None:
+            with self._prefetch_job_lock:
+                current = self._prefetch_jobs.get(request_id)
+                if current is job:
+                    job.status_claimed = False
             return None
+
+        with self._prefetch_job_lock:
+            current = self._prefetch_jobs.get(request_id)
+            if current is job:
+                self._prefetch_jobs.pop(request_id, None)
 
         stride = job.attn_desc.num_object_groups * job.world_size
         num_chunks = job.handle.total_requested_keys // stride
@@ -460,9 +497,6 @@ class LookupModule:
                 },
             )
         )
-
-        with self._prefetch_job_lock:
-            self._prefetch_jobs.pop(request_id, None)
 
         return found_count
 
@@ -560,6 +594,10 @@ class LookupModule:
                 metadata={"request_id": request_id},
             )
         )
+        job = self._take_prefetch_job(request_id)
+        if job is not None:
+            self._start_abandoned_prefetch_cleanup(job)
+
         session = self._ctx.session_manager.remove(request_id)
         self._ctx.event_bus.publish(
             Event(
@@ -636,6 +674,59 @@ class LookupModule:
     def _register_prefetch_job(self, job: _PrefetchJob) -> None:
         with self._prefetch_job_lock:
             self._prefetch_jobs[job.request_id] = job
+
+    def _take_prefetch_job(self, request_id: str) -> _PrefetchJob | None:
+        """Atomically transfer an unclaimed prefetch job to one consumer."""
+        with self._prefetch_job_lock:
+            job = self._prefetch_jobs.get(request_id)
+            if job is None or job.status_claimed:
+                return None
+            return self._prefetch_jobs.pop(request_id)
+
+    def _start_abandoned_prefetch_cleanup(self, job: _PrefetchJob) -> None:
+        """Queue an abandoned prefetch for asynchronous lock cleanup."""
+        with self._abandoned_jobs_cv:
+            self._abandoned_jobs.append(job)
+            self._abandoned_jobs_cv.notify()
+
+    def _run_abandoned_prefetch_cleanup(self) -> None:
+        """Poll abandoned prefetches and release completed read locks."""
+        while True:
+            with self._abandoned_jobs_cv:
+                self._abandoned_jobs_cv.wait_for(
+                    lambda: self._cleanup_stop or self._abandoned_jobs
+                )
+                if self._cleanup_stop and not self._abandoned_jobs:
+                    return
+                jobs = self._abandoned_jobs
+                self._abandoned_jobs = []
+
+            pending: list[_PrefetchJob] = []
+            for job in jobs:
+                try:
+                    retained = self._ctx.storage_manager.query_prefetch_status(
+                        job.handle
+                    )
+                    if retained is None:
+                        pending.append(job)
+                        continue
+                    obj_keys = retained.gather(job.keys)
+                    if obj_keys:
+                        self._ctx.storage_manager.finish_read_prefetched(
+                            obj_keys, read_locks=job.num_kv_readers
+                        )
+                except Exception:
+                    logger.exception(
+                        "Failed to clean up abandoned prefetch for request %s",
+                        job.request_id,
+                    )
+
+            if pending:
+                with self._abandoned_jobs_cv:
+                    self._abandoned_jobs.extend(pending)
+                    if self._cleanup_stop:
+                        return
+                    self._abandoned_jobs_cv.wait(timeout=0.1)
 
     def _active_prefetch_count(self) -> int:
         """Return the number of active prefetch jobs (thread-safe)."""

@@ -180,6 +180,7 @@ class LMCacheMPConnector:
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         mq_timeout: float = DEFAULT_MQ_TIMEOUT,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+        l2_load_timeout: float = 0.0,
     ):
         device = _validate_sglang_kv_pools(k_pool, v_pool)
         self.tp_size = tp_size
@@ -191,6 +192,7 @@ class LMCacheMPConnector:
         self.tp_group = tp_group
         self.instance_id = os.getpid()
         self._mq_timeout = mq_timeout
+        self._l2_load_timeout = l2_load_timeout
         self._heartbeat_interval = heartbeat_interval
         self._registered = False
         self._heartbeat: HeartbeatThread | None = None
@@ -313,16 +315,31 @@ class LMCacheMPConnector:
         the prefetch job by request_id (a string); the result is the number of
         matched chunks once available.
         """
-        # The daemon blocks up to ``self._mq_timeout`` for the result, so give
-        # the response itself a little longer than that to cover the round trip.
+        # The daemon blocks up to ``load_wait`` for the result, so give the
+        # response itself a little longer than that to cover the round trip.
+        # ``l2_load_timeout`` (when > 0) is an L2 load budget independent of
+        # the per-request ``mq_timeout``; falling back to ``mq_timeout``
+        # preserves the historical behavior when it is disabled.
+        load_wait = (
+            self._l2_load_timeout
+            if self._l2_load_timeout > 0.0
+            else self._mq_timeout
+        )
         matched_chunks = self.req_client.wait_prefetch_status(
-            request_id, self._mq_timeout
-        ).result(timeout=self._mq_timeout + _WAIT_LOOKUP_RESPONSE_BUFFER_S)
+            request_id, load_wait
+        ).result(timeout=load_wait + _WAIT_LOOKUP_RESPONSE_BUFFER_S)
         if matched_chunks is None:
-            raise LMCacheTimeoutError(
+            LMCacheTimeoutError(
                 "Timed out waiting for LMCache prefetch to finish",
                 session_id=request_id,
             )
+            logger.warning(
+                "[req=%s] L2 load exceeded l2_load_timeout=%.1fs; "
+                "reporting cache miss for recompute.",
+                request_id,
+                load_wait,
+            )
+            return 0
         return matched_chunks * self._lmcache_chunk_size
 
     def _free_lookup_locks(

@@ -333,6 +333,26 @@ def test_adapter_free_lookup_locks_sends_request():
     assert tp_size == 1
 
 
+def test_adapter_end_session_sends_cleanup_for_unhealthy_lookup():
+    """An unhealthy server may still own a late prefetch and needs cleanup."""
+    # First Party
+    from lmcache.integration.vllm.vllm_multi_process_adapter import (
+        LMCacheMPSchedulerAdapter,
+    )
+
+    adapter = LMCacheMPSchedulerAdapter.__new__(LMCacheMPSchedulerAdapter)
+    adapter._server_urls = ["tcp://test:0"]
+    adapter._health_events = {"tcp://test:0": threading.Event()}
+    adapter._pending_lookups = {"req-1"}
+    adapter._unacked_lookups = {}
+    mock_client = MagicMock(spec=RequestClient)
+    adapter.req_clients = {"tcp://test:0": mock_client}
+
+    adapter.end_session("req-1")
+
+    mock_client.end_session.assert_called_once_with("req-1")
+
+
 def test_adapter_free_lookup_locks_key_matches_lookup():
     """The key created by free_lookup_locks should match the key created by
     maybe_submit_lookup_request (no_worker_id_version, same start/end)."""

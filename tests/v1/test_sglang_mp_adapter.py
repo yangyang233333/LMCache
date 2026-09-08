@@ -129,6 +129,46 @@ class _FakeTorchDev:
         return object()
 
 
+def test_wait_for_lookup_timeout_falls_back_to_miss() -> None:
+    connector = _make_connector(healthy=True)
+    connector._l2_load_timeout = 0.1
+    connector.req_client = MagicMock(name="rpc_client")
+    future = MessagingFuture()
+    future.set_result(None)
+    connector.req_client.wait_prefetch_status.return_value = future
+
+    assert connector._wait_for_lookup("request-timeout") == 0
+    connector.req_client.wait_prefetch_status.assert_called_once_with(
+        "request-timeout", 0.1
+    )
+
+
+def test_lookup_timeout_records_pending_for_end_session_cleanup() -> None:
+    connector = _make_connector(healthy=True)
+    connector._l2_load_timeout = 0.1
+    connector.tp_size = 1
+    connector.page_size = _CHUNK_SIZE
+    connector._pending_lookups = {}
+    connector._pending_lookups_lock = threading.Lock()
+    connector.req_client = MagicMock(name="rpc_client")
+    lookup_future = MessagingFuture()
+    lookup_future.set_result(None)
+    wait_future = MessagingFuture()
+    wait_future.set_result(None)
+    connector.req_client.lookup.return_value = lookup_future
+    connector.req_client.wait_prefetch_status.return_value = wait_future
+    connector._create_key = MagicMock(return_value="lookup-key")
+    connector._global_min_tokens = lambda value: value
+
+    assert connector.lookup_kv(list(range(_CHUNK_SIZE)), "request-timeout") == 0
+    pending = connector._pending_lookups["request-timeout"]
+    assert pending.matched_token_num == 0
+    assert pending.locks_held is False
+
+    connector.end_session("request-timeout")
+    connector.req_client.end_session.assert_called_once_with("request-timeout")
+
+
 def test_completed_future_resolves_to_given_result() -> None:
     _, _, _completed_future, _, _, _ = _import_adapter_symbols()
     done_true = _completed_future(True)
